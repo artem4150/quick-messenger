@@ -30,18 +30,42 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  const user = (socket as any).user;
-  console.log('client connected', socket.id, user?.email);
+  console.log('client connected', socket.id);
 
-  socket.on('room:join', ({ roomId }) => socket.join(roomId));
-  socket.on('room:leave', ({ roomId }) => socket.leave(roomId));
+  // join/leave
+  socket.on('room:join', ({ roomId }) => {
+    socket.join(roomId);
+    const room = io.sockets.adapter.rooms.get(roomId) || new Set<string>();
+    const ids = Array.from(room);
 
-  socket.on('chat:message', (msg) => {
-    // Опционально: проставить автора с сервера
-    msg.author = user?.name || 'user';
-    socket.to(msg.roomId).emit('chat:message', msg);
+    // Разрешим максимум 2 участника на комнату
+    if (ids.length > 2) {
+      socket.leave(roomId);
+      io.to(socket.id).emit('webrtc:full', { roomId });
+      return;
+    }
+
+    // Когда в комнате двое — назначаем роли и даём сигнал "готово"
+    if (ids.length === 2) {
+      // детерминируем роли по алфавиту id
+      const [a, b] = ids.sort();
+      io.to(a).emit('webrtc:role', { role: 'offerer', roomId });
+      io.to(b).emit('webrtc:role', { role: 'answerer', roomId });
+      io.to(roomId).emit('webrtc:ready', { roomId });
+    }
   });
 
+  socket.on('room:leave', ({ roomId }) => {
+    socket.leave(roomId);
+  });
+
+  // Для обратной совместимости, если где-то осталось webrtc:join
+  socket.on('webrtc:join', ({ roomId }) => socket.emit('room:join', { roomId }));
+
+  // Текстовые сообщения как было
+  socket.on('chat:message', (msg) => socket.to(msg.roomId).emit('chat:message', msg));
+
+  // Сигналинг
   socket.on('webrtc:offer', ({ roomId, sdp }) => socket.to(roomId).emit('webrtc:offer', { sdp }));
   socket.on('webrtc:answer', ({ roomId, sdp }) => socket.to(roomId).emit('webrtc:answer', { sdp }));
   socket.on('webrtc:ice', ({ roomId, candidate }) => socket.to(roomId).emit('webrtc:ice', { candidate }));

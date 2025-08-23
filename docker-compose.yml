@@ -47,18 +47,18 @@ services:
   
   coturn:
     image: instrumentisto/coturn
+    restart: unless-stopped
+    network_mode: "host"                         # ← ключевое
     command: >
       -n --log-file=stdout
+      --realm=messenger.local
+      --fingerprint
+      --listening-port=3478
       --min-port=49160 --max-port=49200
-      --realm=messenger.local --listening-port=3478 --fingerprint
       --lt-cred-mech
       --user=turnuser:turnpass
-      --external-ip=77.110.98.32            # <— публичный IP
-    restart: unless-stopped
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "49160-49200:49160-49200/udp"       # <— ОБЯЗАТЕЛЬНО
+      --external-ip=77.110.98.32           
+
 
   web:
     build:

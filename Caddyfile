@@ -1,0 +1,9 @@
+:3001 {
+  encode zstd gzip
+
+  
+  reverse_proxy /socket.io/* signaling:4000
+
+ 
+  reverse_proxy web:3000
+}

@@ -1,16 +1,18 @@
 export function createPeerConnection() {
-  const url = process.env.NEXT_PUBLIC_TURN_URL;
-  const username = process.env.NEXT_PUBLIC_TURN_USER;
-  const credential = process.env.NEXT_PUBLIC_TURN_PASS;
+  const host = process.env.NEXT_PUBLIC_TURN_URL?.replace(/^turns?:/, '') || '77.110.98.32:3478';
+  const username = process.env.NEXT_PUBLIC_TURN_USER || 'turnuser';
+  const credential = process.env.NEXT_PUBLIC_TURN_PASS || 'turnpass';
 
   const iceServers: RTCIceServer[] = [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: [`turn:${host}?transport=udp`], username, credential },
+    { urls: [`turn:${host}?transport=tcp`], username, credential },
   ];
-  if (url && username && credential) {
-    iceServers.push({ urls: [url], username, credential });
-  }
 
-  return new RTCPeerConnection({ iceServers });
+  return new RTCPeerConnection({
+    iceServers,
+    iceCandidatePoolSize: 2,
+  });
 }
 
 export async function getMedia(constraints: MediaStreamConstraints) {

@@ -44,18 +44,21 @@ services:
     ports:
       - "4000:4000"
 
+  
   coturn:
     image: instrumentisto/coturn
     command: >
-      -n --log-file=stdout \
-      --min-port=49160 --max-port=49200 \
-      --realm=messenger.local --listening-port=3478 --fingerprint \
-      --lt-cred-mech \
+      -n --log-file=stdout
+      --min-port=49160 --max-port=49200
+      --realm=messenger.local --listening-port=3478 --fingerprint
+      --lt-cred-mech
       --user=turnuser:turnpass
+      --external-ip=77.110.98.32            # <— публичный IP
     restart: unless-stopped
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"       # <— ОБЯЗАТЕЛЬНО
 
   web:
     build:

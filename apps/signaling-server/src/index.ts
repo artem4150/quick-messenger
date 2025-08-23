@@ -1,76 +1,103 @@
 import express from 'express';
+import http from 'http';
 import cors from 'cors';
-import { createServer } from 'http';
 import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
 
 const app = express();
-app.use(cors());
-const httpServer = createServer(app);
 
+const ORIGIN = process.env.CORS_ORIGIN || '*';
 const PORT = Number(process.env.PORT || 4000);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+const JWT_SECRET = process.env.JWT_SECRET || '';
 
-const io = new Server(httpServer, {
-  cors: { origin: [CORS_ORIGIN], methods: ['GET','POST'] }
-});
+app.use(cors({ origin: ORIGIN, credentials: true }));
 
-// JWT‑middleware на соединение
-io.use((socket, next) => {
-  try {
-    const token = socket.handshake.auth?.token || (socket.handshake.headers.authorization?.toString().replace('Bearer ', '') ?? '');
-    if (!token) return next(new Error('no_token'));
-    const payload = jwt.verify(token, JWT_SECRET) as any;
-    (socket as any).user = { id: payload.sub, email: payload.email, name: payload.name };
-    next();
-  } catch (e) {
-    next(new Error('invalid_token'));
-  }
+const server = http.createServer(app);
+const io = new Server(server, {
+  path: '/socket.io',
+  cors: { origin: ORIGIN, credentials: true },
 });
 
 io.on('connection', (socket) => {
   console.log('client connected', socket.id);
 
-  // join/leave
-  socket.on('room:join', ({ roomId }) => {
-    socket.join(roomId);
-    const room = io.sockets.adapter.rooms.get(roomId) || new Set<string>();
-    const ids = Array.from(room);
-
-    // Разрешим максимум 2 участника на комнату
-    if (ids.length > 2) {
-      socket.leave(roomId);
-      io.to(socket.id).emit('webrtc:full', { roomId });
+  // (опционально) валидация JWT, если передаётся в handshake.auth.token
+  const token = (socket.handshake.auth as any)?.token;
+  if (JWT_SECRET && token) {
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+      console.warn('invalid token, disconnect', socket.id);
+      socket.disconnect(true);
       return;
     }
+  }
 
-    // Когда в комнате двое — назначаем роли и даём сигнал "готово"
+  // Общая функция назначения ролей и ready, когда в комнате ровно 2 участника
+  const maybeAssignRoles = (roomId: string) => {
+    const room = io.sockets.adapter.rooms.get(roomId) || new Set<string>();
+    const ids = Array.from(room).sort(); // детерминируем порядок
+    console.log(`[room ${roomId}] members:`, ids);
     if (ids.length === 2) {
-      // детерминируем роли по алфавиту id
-      const [a, b] = ids.sort();
-      io.to(a).emit('webrtc:role', { role: 'offerer', roomId });
-      io.to(b).emit('webrtc:role', { role: 'answerer', roomId });
+      const [offerer, answerer] = ids;
+      console.log(`[roles ${roomId}] offerer=${offerer} answerer=${answerer}`);
+      io.to(offerer).emit('webrtc:role', { role: 'offerer', roomId });
+      io.to(answerer).emit('webrtc:role', { role: 'answerer', roomId });
       io.to(roomId).emit('webrtc:ready', { roomId });
+    } else if (ids.length > 2) {
+      // ограничим комнату двумя участниками
+      socket.leave(roomId);
+      io.to(socket.id).emit('webrtc:full', { roomId });
     }
+  };
+
+  // Правильный join
+  socket.on('room:join', ({ roomId }: { roomId: string }) => {
+    if (!roomId) return;
+    socket.join(roomId);
+    console.log('[room:join]', roomId, 'by', socket.id);
+    maybeAssignRoles(roomId);
   });
 
-  socket.on('room:leave', ({ roomId }) => {
+  socket.on('room:leave', ({ roomId }: { roomId: string }) => {
+    if (!roomId) return;
     socket.leave(roomId);
+    console.log('[room:leave]', roomId, 'by', socket.id);
   });
 
-  // Для обратной совместимости, если где-то осталось webrtc:join
-  socket.on('webrtc:join', ({ roomId }) => socket.emit('room:join', { roomId }));
+  // Алиас для обратной совместимости: webrtc:join реально выполняет join
+  socket.on('webrtc:join', ({ roomId }: { roomId: string }) => {
+    if (!roomId) return;
+    socket.join(roomId);
+    console.log('[webrtc:join -> join]', roomId, 'by', socket.id);
+    maybeAssignRoles(roomId);
+  });
 
-  // Текстовые сообщения как было
-  socket.on('chat:message', (msg) => socket.to(msg.roomId).emit('chat:message', msg));
+  // Чат
+  socket.on('chat:message', (msg: { roomId: string }) => {
+    if (!msg?.roomId) return;
+    socket.to(msg.roomId).emit('chat:message', msg);
+  });
 
   // Сигналинг
-  socket.on('webrtc:offer', ({ roomId, sdp }) => socket.to(roomId).emit('webrtc:offer', { sdp }));
-  socket.on('webrtc:answer', ({ roomId, sdp }) => socket.to(roomId).emit('webrtc:answer', { sdp }));
-  socket.on('webrtc:ice', ({ roomId, candidate }) => socket.to(roomId).emit('webrtc:ice', { candidate }));
+  socket.on('webrtc:offer', ({ roomId, sdp }: { roomId: string; sdp: string }) => {
+    if (!roomId || !sdp) return;
+    socket.to(roomId).emit('webrtc:offer', { sdp });
+  });
 
-  socket.on('disconnect', () => console.log('client disconnected', socket.id));
+  socket.on('webrtc:answer', ({ roomId, sdp }: { roomId: string; sdp: string }) => {
+    if (!roomId || !sdp) return;
+    socket.to(roomId).emit('webrtc:answer', { sdp });
+  });
+
+  socket.on('webrtc:ice', ({ roomId, candidate }: { roomId: string; candidate: RTCIceCandidateInit }) => {
+    if (!roomId || !candidate) return;
+    socket.to(roomId).emit('webrtc:ice', { candidate });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('client disconnected', socket.id);
+  });
 });
 
-httpServer.listen(PORT, () => console.log('Signaling on :' + PORT));
+server.listen(PORT, () => console.log(`Signaling on :${PORT}`));

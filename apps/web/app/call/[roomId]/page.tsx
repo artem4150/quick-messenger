@@ -12,7 +12,8 @@ export default function CallPage() {
   const { roomId } = useParams<{ roomId: string }>();
   const { socket, connect, joinRoom, leaveRoom } = useAppStore();
 
-  const [mounted, setMounted] = useState(false);               // 🔒 гейт против hydration error
+  // ⚠️ Все хуки вызываются всегда и в одном порядке
+  const [mounted, setMounted] = useState(false); // не используем для "раннего return"
   const [role, setRole] = useState<'offerer' | 'answerer' | null>(null);
   const [ready, setReady] = useState(false);
   const [isMuted, setMuted] = useState(false);
@@ -22,23 +23,22 @@ export default function CallPage() {
   const remoteVideo = useRef<HTMLVideoElement>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
 
-  // Разрешаем рендер только после монтирования
+  // просто отмечаем, что смонтировались (эффекты ниже всё равно клиентские)
   useEffect(() => { setMounted(true); }, []);
-  if (!mounted) return null;
 
-  // 1) Гарантируем соединение сокета даже при прямом заходе на /call/...
+  // 1) гарантируем подключение сокета
   useEffect(() => {
     if (!socket) connect();
   }, [socket, connect]);
 
-  // 2) Вступаем/выходим из комнаты (один раз на сокет+roomId)
+  // 2) входим/выходим из комнаты
   useEffect(() => {
     if (!socket || !roomId) return;
     joinRoom(roomId);
     return () => leaveRoom(roomId);
   }, [socket, roomId, joinRoom, leaveRoom]);
 
-  // 3) Один раз создаём PC, подписываемся на события сокета, цепляем медиа
+  // 3) создаём RTCPeerConnection, медиа и подписки сокета (один раз на сокет+roomId)
   useEffect(() => {
     if (!socket || !roomId) return;
 
@@ -53,6 +53,7 @@ export default function CallPage() {
           audio: { echoCancellation: true, noiseSuppression: true },
         });
       } catch {
+        // фолбэк, если камера занята/запрещена
         localStream = await getMedia({
           video: false,
           audio: { echoCancellation: true, noiseSuppression: true },
@@ -62,7 +63,7 @@ export default function CallPage() {
 
       if (localVideo.current) {
         localVideo.current.srcObject = localStream!;
-        localVideo.current.muted = true;
+        localVideo.current.muted = true; // чтобы не было эха
       }
 
       const pc = createPeerConnection();
@@ -73,21 +74,24 @@ export default function CallPage() {
       pc.onconnectionstatechange = () =>
         console.log('PC state:', pc.connectionState);
 
-      localStream!.getTracks().forEach((t) => pc.addTrack(t, localStream!));
+      // локальные дорожки
+      localStream!.getTracks().forEach(t => pc.addTrack(t, localStream!));
 
+      // удалённый поток
       pc.ontrack = (ev) => {
-        ev.streams[0]?.getTracks().forEach((t) => remoteStream.addTrack(t));
+        ev.streams[0]?.getTracks().forEach(t => remoteStream.addTrack(t));
         if (remoteVideo.current && remoteVideo.current.srcObject !== remoteStream) {
           remoteVideo.current.srcObject = remoteStream;
           remoteVideo.current.play?.().catch(() => {});
         }
       };
 
+      // ICE
       pc.onicecandidate = (e) => {
         if (e.candidate) socket.emit('webrtc:ice', { roomId, candidate: e.candidate });
       };
 
-      // сокет-слушатели
+      // подписки на сигналинг
       const onRole = ({ role }: { role: 'offerer' | 'answerer' }) => {
         console.log('role:', role);
         setRole(role);
@@ -113,8 +117,9 @@ export default function CallPage() {
       };
       const onIce = async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
         if (!candidate) return;
-        try { await pc.addIceCandidate(candidate); }
-        catch (e) { console.warn('addIceCandidate failed', e); }
+        try { await pc.addIceCandidate(candidate); } catch (e) {
+          console.warn('addIceCandidate failed', e);
+        }
       };
 
       socket.on('webrtc:role', onRole);
@@ -123,7 +128,7 @@ export default function CallPage() {
       socket.on('webrtc:answer', onAnswer);
       socket.on('webrtc:ice', onIce);
 
-      // cleanup
+      // отписка на размонтировании
       return () => {
         socket.off('webrtc:role', onRole);
         socket.off('webrtc:ready', onReady);
@@ -140,7 +145,7 @@ export default function CallPage() {
     };
   }, [socket, roomId]);
 
-  // 4) Отдельный эффект — инициировать offer при role+ready (без пересоздания PC)
+  // 4) инициируем offer ТОЛЬКО когда назначена роль offerer и пришло ready
   useEffect(() => {
     const pc = pcRef.current;
     if (!pc || role !== 'offerer' || !ready) return;
@@ -160,7 +165,7 @@ export default function CallPage() {
     })();
   }, [role, ready, roomId]);
 
-  // UI-кнопки
+  // UI
   const toggleMic = () => {
     const stream = localVideo.current?.srcObject as MediaStream | null;
     const track = stream?.getAudioTracks()[0];

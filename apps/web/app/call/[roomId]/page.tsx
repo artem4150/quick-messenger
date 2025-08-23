@@ -19,6 +19,7 @@ export default function CallPage() {
   const [ready, setReady] = useState(false);
   const [isMuted, setMuted] = useState(false);
   const [isCamOff, setCamOff] = useState(false);
+  const [mediaReady, setMediaReady] = useState(false);
 
   const localVideo = useRef<HTMLVideoElement>(null);
   const remoteVideo = useRef<HTMLVideoElement>(null);
@@ -34,30 +35,87 @@ export default function CallPage() {
     if (!socket) connect();
   }, [socket, connect]);
 
-  // 2) входим/выходим из комнаты
-  useEffect(() => {
-    if (!socket || !roomId) return;
-    joinRoom(roomId);
-
-    return () => leaveRoom(roomId);
-  }, [socket, roomId, joinRoom, leaveRoom]);
-
-  // 3) создаём RTCPeerConnection, медиа и подписки сокета (один раз на сокет+roomId)
+  // 2) создаём RTCPeerConnection, медиа и подписки сокета (один раз на сокет+roomId)
   useEffect(() => {
     if (!socket || !roomId) return;
 
     let cancelled = false;
-    let localStream: MediaStream | null = null;
     const remoteStream = new MediaStream();
 
+    const pc = createPeerConnection();
+    pcRef.current = pc;
+
+    pc.oniceconnectionstatechange = () =>
+      console.log("ICE state:", pc.iceConnectionState);
+    pc.onconnectionstatechange = () =>
+      console.log("PC state:", pc.connectionState);
+
+    pc.ontrack = (ev) => {
+      remoteStream.addTrack(ev.track);
+      if (remoteVideo.current) {
+        if (remoteVideo.current.srcObject !== remoteStream) {
+          remoteVideo.current.srcObject = remoteStream;
+        }
+        remoteVideo.current.play?.().catch(() => {});
+      }
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate)
+        socket.emit("webrtc:ice", { roomId, candidate: e.candidate });
+    };
+
+    const onRole = ({ role }: { role: "offerer" | "answerer" }) => {
+      console.log("role:", role);
+      setRole(role);
+    };
+    const onReady = () => {
+      console.log("ready");
+      setReady(true);
+    };
+    const onOffer = async ({ sdp }: { sdp: string }) => {
+      if (pc.signalingState === "closed") return;
+      if (!pc.currentRemoteDescription) {
+        await pc.setRemoteDescription({ type: "offer", sdp });
+        const answer = await pc.createAnswer();
+
+        await pc.setLocalDescription(answer);
+        socket.emit("webrtc:answer", { roomId, sdp: answer.sdp! });
+      }
+    };
+    const onAnswer = async ({ sdp }: { sdp: string }) => {
+      if (pc.signalingState === "closed") return;
+      if (!pc.currentRemoteDescription) {
+        await pc.setRemoteDescription({ type: "answer", sdp });
+      }
+    };
+    const onIce = async ({
+      candidate,
+    }: {
+      candidate: RTCIceCandidateInit;
+    }) => {
+      if (!candidate) return;
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (e) {
+        console.warn("addIceCandidate failed", e);
+      }
+    };
+
+    socket.on("webrtc:role", onRole);
+    socket.on("webrtc:ready", onReady);
+    socket.on("webrtc:offer", onOffer);
+    socket.on("webrtc:answer", onAnswer);
+    socket.on("webrtc:ice", onIce);
+
     (async () => {
+      let localStream: MediaStream | null = null;
       try {
         localStream = await getMedia({
           video: true,
           audio: { echoCancellation: true, noiseSuppression: true },
         });
       } catch {
-        // фолбэк, если камера занята/запрещена
         localStream = await getMedia({
           video: false,
           audio: { echoCancellation: true, noiseSuppression: true },
@@ -67,106 +125,32 @@ export default function CallPage() {
 
       if (localVideo.current) {
         localVideo.current.srcObject = localStream!;
-        localVideo.current.muted = true; // чтобы не было эха
+        localVideo.current.muted = true;
       }
 
-      const pc = createPeerConnection();
-
-      pcRef.current = pc;
-
-      pc.oniceconnectionstatechange = () =>
-        console.log("ICE state:", pc.iceConnectionState);
-      pc.onconnectionstatechange = () =>
-        console.log("PC state:", pc.connectionState);
-
-      // локальные дорожки
       localStream!.getTracks().forEach((t) => pc.addTrack(t, localStream!));
-
-      // удалённый поток
-      pc.ontrack = (ev) => {
-        // используем track из события, чтобы всегда добавлять поток
-        remoteStream.addTrack(ev.track);
-        if (remoteVideo.current) {
-          if (remoteVideo.current.srcObject !== remoteStream) {
-            remoteVideo.current.srcObject = remoteStream;
-          }
-          // повторяем попытку воспроизведения на каждый track
-          remoteVideo.current.play?.().catch(() => {});
-        }
-      };
-
-      // ICE
-      pc.onicecandidate = (e) => {
-        if (e.candidate)
-          socket.emit("webrtc:ice", { roomId, candidate: e.candidate });
-      };
-
-      // подписки на сигналинг
-      const onRole = ({ role }: { role: "offerer" | "answerer" }) => {
-        console.log("role:", role);
-        setRole(role);
-      };
-      const onReady = () => {
-        console.log("ready");
-        setReady(true);
-      };
-      const onOffer = async ({ sdp }: { sdp: string }) => {
-        if (pc.signalingState === "closed") return;
-        if (!pc.currentRemoteDescription) {
-          await pc.setRemoteDescription({ type: "offer", sdp });
-          const answer = await pc.createAnswer();
-
-          await pc.setLocalDescription(answer);
-          socket.emit("webrtc:answer", { roomId, sdp: answer.sdp! });
-        }
-      };
-      const onAnswer = async ({ sdp }: { sdp: string }) => {
-        if (pc.signalingState === "closed") return;
-        if (!pc.currentRemoteDescription) {
-          await pc.setRemoteDescription({ type: "answer", sdp });
-        }
-      };
-      const onIce = async ({
-        candidate,
-      }: {
-        candidate: RTCIceCandidateInit;
-      }) => {
-        if (!candidate) return;
-        try {
-          await pc.addIceCandidate(candidate);
-        } catch (e) {
-          console.warn("addIceCandidate failed", e);
-        }
-      };
-
-      socket.on("webrtc:role", onRole);
-      socket.on("webrtc:ready", onReady);
-      socket.on("webrtc:offer", onOffer);
-      socket.on("webrtc:answer", onAnswer);
-      socket.on("webrtc:ice", onIce);
-
-      // отписка на размонтировании
-      return () => {
-        socket.off("webrtc:role", onRole);
-        socket.off("webrtc:ready", onReady);
-        socket.off("webrtc:offer", onOffer);
-        socket.off("webrtc:answer", onAnswer);
-        socket.off("webrtc:ice", onIce);
-      };
+      setMediaReady(true);
+      joinRoom(roomId);
     })();
 
     return () => {
       cancelled = true;
+      leaveRoom(roomId);
+      socket.off("webrtc:role", onRole);
+      socket.off("webrtc:ready", onReady);
+      socket.off("webrtc:offer", onOffer);
+      socket.off("webrtc:answer", onAnswer);
+      socket.off("webrtc:ice", onIce);
       pcRef.current?.close();
       pcRef.current = null;
     };
-  }, [socket, roomId]);
+  }, [socket, roomId, joinRoom, leaveRoom]);
 
-  // 4) инициируем offer ТОЛЬКО когда назначена роль offerer и пришло ready
+  // 3) инициируем offer ТОЛЬКО когда назначена роль offerer, пришло ready и готова медиа
   useEffect(() => {
     const pc = pcRef.current;
 
-    if (!pc || role !== "offerer" || !ready) return;
+    if (!pc || role !== "offerer" || !ready || !mediaReady) return;
 
     (async () => {
       if (pc.signalingState === "stable" && !pc.currentLocalDescription) {
@@ -182,7 +166,7 @@ export default function CallPage() {
         });
       }
     })();
-  }, [role, ready, roomId]);
+  }, [role, ready, mediaReady, roomId]);
 
   // UI
   const toggleMic = () => {

@@ -15,6 +15,11 @@ export function createPeerConnection() {
   });
 }
 
+export async function replaceAudioTrack(pc: RTCPeerConnection, newTrack: MediaStreamTrack | null) {
+  const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
+  if (sender) await sender.replaceTrack(newTrack);
+}
+
 export async function getMedia(constraints: MediaStreamConstraints) {
   try {
     return await navigator.mediaDevices.getUserMedia(constraints);
@@ -29,3 +34,20 @@ export async function getMedia(constraints: MediaStreamConstraints) {
     throw e;
   }
 }
+
+export async function replaceVideoTrack(pc: RTCPeerConnection, newTrack: MediaStreamTrack | null) {
+  const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+  if (sender) await sender.replaceTrack(newTrack);
+}
+
+// перезапуск ICE, затем (если мы инициатор) — отправка нового offer с iceRestart
+export async function iceRestart(pc: RTCPeerConnection, emitOffer: (offerSdp: string) => void) {
+  try {
+    const offer = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(offer);
+    emitOffer(offer.sdp!);
+  } catch (e) {
+    console.warn('iceRestart failed', e);
+  }
+}
+

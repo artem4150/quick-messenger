@@ -28,6 +28,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     restart: unless-stopped
     ports:
       - "5001:5001"
@@ -36,6 +38,7 @@ services:
     build:
       context: ./apps/signaling-server
     environment:
+      DATABASE_URL: postgresql://messenger:messenger@db:5432/messenger
       JWT_SECRET: supersecret_dev_change_me
       CORS_ORIGIN: http://localhost:3000
       PORT: 4000
@@ -92,6 +95,25 @@ services:
     # Caddy слушает только внутри сети compose на 3001
     ports:
       - "3001:3001"
+
+  migrator:
+    image: postgres:16-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: messenger
+    volumes:
+      - ./db/migrations:/migrations:ro
+    # Запускаем psql для каждого файла; -v ON_ERROR_STOP=1 — падать при ошибке
+    command: >
+      sh -c '
+        for f in /migrations/*.sql; do
+          echo "Applying $$f";
+          psql -h db -U messenger -d messenger -v ON_ERROR_STOP=1 -f "$$f";
+        done
+      '
+    restart: "no"
 
   cloudflared:
     image: cloudflare/cloudflared:latest

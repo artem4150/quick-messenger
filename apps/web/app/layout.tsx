@@ -4,10 +4,10 @@ import type { ReactNode } from 'react';
 
 export default function RootLayout({ children }: { children: ReactNode }) {
 return (
-<html lang="ru">
-<body className="min-h-dvh bg-neutral-950 text-neutral-50">
-<div className="mx-auto max-w-md">{children}</div>
-</body>
-</html>
+    <html lang="ru" className="h-full w-full">
+      <body className="h-dvh w-dvw overflow-hidden bg-content1 text-foreground">
+        {children}
+      </body>
+    </html>
 );
 }

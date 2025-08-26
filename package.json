@@ -1,0 +1,23 @@
+{
+  "name": "quick-messenger",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/artem4150/quick-messenger.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/artem4150/quick-messenger/issues"
+  },
+  "homepage": "https://github.com/artem4150/quick-messenger#readme",
+  "description": "",
+  "dependencies": {
+    "pg": "^8.16.3",
+    "uuid": "^11.1.0"
+  }
+}

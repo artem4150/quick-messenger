@@ -112,7 +112,12 @@ export const useAppStore = create<State>((set, get) => ({
       console.log("socket connected", s.id);
       await get().requestRooms();
       const current = get().currentRoomId;
-      if (current) s.emit("room:join", { roomId: current });
+      if (current) {
+        s.emit("room:join", { roomId: current });
+        if (!get().messages[current]?.length) {
+          s.emit("chat:history:get", { roomId: current, limit: 50 });
+        }
+      }
     });
 
     s.on("connect_error", (e) => console.warn("socket error", e.message));

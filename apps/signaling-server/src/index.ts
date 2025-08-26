@@ -1,64 +1,36 @@
 // apps/signaling-server/src/index.ts
 import express from "express";
-import cors, { CorsOptions } from "cors";
+import cors from "cors";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
-import { v4 as uuid } from "uuid";
-// ⚠️ ESM: локальные импорты с .js
+import { randomUUID } from "crypto";
 import { pool } from "./db.js";
-import { listRoomsForUser, softDeleteRoomForUser } from "./db.js";
 import { requireAuth } from "./httpAuth.js";
 
 const app = express();
 app.use(express.json());
 
-const PORT = Number(process.env.PORT || 4000);
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
-
-/** Разрешаем localhost и *.trycloudflare.com + то, что явно задано в CORS_ORIGIN (через запятую). */
-const allowOrigin = (origin?: string) => {
-  if (!origin) return true; // curl / same-origin
-  try {
-    const u = new URL(origin);
-    if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return true;
-    if (u.hostname.endsWith("trycloudflare.com")) return true;
-    const envList = (process.env.CORS_ORIGIN ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (envList.includes(origin)) return true;
-  } catch {}
-  return false;
-};
-
-const corsOptions: CorsOptions = {
-  origin(origin, cb) {
-    if (allowOrigin(origin)) return cb(null, true); // echo back origin (не "*")
-    return cb(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type"],
-};
-
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // preflight
+// Если ходишь напрямую (минуя rewrites) — включи CORS под свой домен
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
+app.use(
+  cors({
+    origin: CORS_ORIGIN,
+    credentials: true,
+  })
+);
 
 const httpServer = createServer(app);
 
+const PORT = Number(process.env.PORT || 4000);
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
+
+// ---------------- WS ----------------
 const io = new Server(httpServer, {
-  cors: {
-    origin(origin, cb) {
-      if (allowOrigin(origin)) return cb(null, true);
-      cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  },
+  cors: { origin: [CORS_ORIGIN], methods: ["GET", "POST"] },
   path: "/socket.io",
 });
 
-// ---------- SOCKET AUTH ----------
 io.use((socket, next) => {
   try {
     const token = (socket.handshake.auth as any)?.token;
@@ -72,16 +44,132 @@ io.use((socket, next) => {
   }
 });
 
-// ----------------------- HTTP (под префиксом /sg/*) -----------------------
-app.get("/sg/health", (_req, res) => res.json({ ok: true }));
+// ---------- helpers ----------
+async function getUserByEmail(email: string) {
+  const r = await pool.query(
+    `SELECT id, email, name FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+    [email]
+  );
+  return r.rows[0] || null;
+}
 
-// список комнат для текущего пользователя
-app.get("/sg/rooms", requireAuth, async (req: any, res) => {
+function dmRoomIdFor(a: string, b: string) {
+  const [x, y] = [a, b].sort();
+  return `dm_${x}_${y}`;
+}
+
+// ---------- HTTP API (/api/*) ----------
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+
+// история сообщений комнаты (последние 50 по времени)
+app.get("/api/rooms/:roomId/messages", requireAuth, async (req: any, res) => {
+  const userId = Number(req.userId);
+  const roomId = Number(req.params.roomId);
+
+  // проверим, что пользователь член комнаты
+  const m = await pool.query(
+    `SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND deleted_at IS NULL LIMIT 1`,
+    [roomId, userId]
+  );
+  if (m.rowCount === 0) return res.status(403).json({ error: "NOT_A_MEMBER" });
+
+  const q = await pool.query(
+    `SELECT
+       id,
+       room_id,
+       author_id::text AS author_id,                           -- ВАЖНО: строкой
+       text,
+       EXTRACT(EPOCH FROM at) * 1000 AS at                     -- ms для фронта
+     FROM messages
+     WHERE room_id = $1
+     ORDER BY at DESC
+     LIMIT 50`,
+    [roomId]
+  );
+
+  // отдаём по возрастанию времени (удобнее рисовать)
+  const rows = q.rows.reverse();
+  res.json(rows);
+});
+
+// отправить сообщение в комнату
+app.post("/api/rooms/:roomId/messages", requireAuth, async (req: any, res) => {
+  const userId = Number(req.userId);
+  const roomId = Number(req.params.roomId);
+  const { text } = req.body ?? {};
+  if (!text || !String(text).trim()) return res.status(400).json({ error: "EMPTY" });
+
+  // членство
+  const m = await pool.query(
+    `SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND deleted_at IS NULL LIMIT 1`,
+    [roomId, userId]
+  );
+  if (m.rowCount === 0) return res.status(403).json({ error: "NOT_A_MEMBER" });
+
+  const ins = await pool.query(
+    `INSERT INTO messages (room_id, author_id, text)
+     VALUES ($1, $2, $3)
+     RETURNING
+       id,
+       room_id,
+       author_id::text AS author_id,                            -- строкой
+       text,
+       EXTRACT(EPOCH FROM at) * 1000 AS at`,
+    [roomId, userId, text]
+  );
+
+  const msg = ins.rows[0];
+
+  // если у вас есть WebSocket/Socket.IO — рассылаем в комнату
   try {
-    const rows = await listRoomsForUser(req.userId);
-    const mapped = rows.map((r: any) => ({
+    io?.to(`room:${roomId}`).emit("message:new", msg);
+  } catch {}
+
+  res.status(201).json(msg);
+});
+
+
+
+
+
+
+// Список комнат пользователя
+app.get("/api/rooms", requireAuth, async (req: any, res) => {
+  const userId = req.userId as string;
+  try {
+const q = await pool.query(
+  `
+  SELECT
+    r.id,
+    COALESCE(r.title, r.id) AS title,
+    lm.last_message,
+    EXTRACT(EPOCH FROM COALESCE(lm.last_at, r.created_at)) * 1000 AS last_at,
+    COALESCE(rm.unread, 0)      AS unread,
+    COALESCE(rm.pinned, FALSE)  AS pinned,
+    COALESCE(rm.muted,  FALSE)  AS muted
+  FROM room_members rm
+  JOIN rooms r ON r.id = rm.room_id
+  LEFT JOIN LATERAL (
+    SELECT m.text AS last_message, m.at AS last_at
+    FROM messages m
+    WHERE m.room_id = r.id
+    ORDER BY m.at DESC
+    LIMIT 1
+  ) lm ON true
+  WHERE rm.user_id = $1
+    AND rm.deleted_at IS NULL
+  ORDER BY
+    COALESCE(rm.pinned, FALSE) DESC,
+    COALESCE(lm.last_at, r.created_at) DESC
+  `,
+  [userId]
+);
+
+
+    const rooms = q.rows.map((r) => ({
       id: r.id,
-      title: r.title || r.id,
+      title: r.title,
       lastMessage: r.last_message ?? null,
       lastAt: r.last_at ? Number(r.last_at) : null,
       unread: r.unread ?? 0,
@@ -89,106 +177,181 @@ app.get("/sg/rooms", requireAuth, async (req: any, res) => {
       muted: !!r.muted,
       typing: false,
     }));
-    res.json(mapped);
+
+    res.json(rooms);
   } catch (e) {
-    console.error("GET /sg/rooms failed", e);
+    console.error("GET /api/rooms failed:", e);
     res.status(500).json({ error: "ROOMS_FAILED" });
   }
 });
 
-// добавить контакт по email (двусторонняя запись в contacts по canonical-порядку)
-app.post("/sg/contacts/add-email", requireAuth, async (req: any, res) => {
+// Добавить контакт по email -> создать/вернуть DM-комнату
+app.post("/api/contacts/add-email", requireAuth, async (req: any, res) => {
+  const inviterId = req.userId as string;
+  const { email } = req.body as { email?: string };
+  if (!email) return res.status(400).json({ error: "NO_EMAIL" });
+
   try {
-    const { email } = req.body as { email?: string };
-    if (!email) return res.status(400).json({ error: "EMAIL_REQUIRED" });
+    const other = await getUserByEmail(email);
+    if (!other) return res.status(404).json({ error: "USER_NOT_FOUND" });
+    if (other.id === inviterId)
+      return res.status(400).json({ error: "SELF_NOT_ALLOWED" });
 
-    // предполагаем, что таблица users есть в той же БД (auth-api её создаёт)
-    const u = await pool.query<{ id: string; email: string; name?: string }>(
-      `SELECT id, email, name FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email]
-    );
-    if (!u.rows.length) return res.status(404).json({ error: "USER_NOT_FOUND" });
-
-    const me = req.userId as string;
-    const other = u.rows[0].id;
-    if (me === other) return res.status(400).json({ error: "SELF_FORBIDDEN" });
-
-    const [a, b] = me < other ? [me, other] : [other, me];
+    const [a, b] = [inviterId, other.id].sort();
     await pool.query(
-      `INSERT INTO contacts(a_user_id, b_user_id) VALUES($1,$2)
-       ON CONFLICT (a_user_id, b_user_id) DO NOTHING`,
+      `INSERT INTO contacts(a_user_id,b_user_id)
+       VALUES ($1,$2) ON CONFLICT (a_user_id,b_user_id) DO NOTHING`,
       [a, b]
     );
 
-    res.json({ ok: true, contact: { id: other, email: u.rows[0].email, name: u.rows[0].name ?? null } });
-  } catch (e) {
-    console.error("POST /sg/contacts/add-email", e);
-    res.status(500).json({ error: "ADD_CONTACT_FAILED" });
-  }
-});
-
-// создать инвайт (type: 'contact' | 'room')
-app.post("/sg/invites/create", requireAuth, async (req: any, res) => {
-  try {
-    const { type, roomId, ttlDays = 7 } = req.body as {
-      type: "contact" | "room";
-      roomId?: string;
-      ttlDays?: number;
-    };
-    if (type !== "contact" && type !== "room") {
-      return res.status(400).json({ error: "BAD_TYPE" });
-    }
-    if (type === "room" && !roomId) {
-      return res.status(400).json({ error: "ROOM_ID_REQUIRED" });
-    }
-
-    const token = uuid();
-    const expires = new Date(Date.now() + Math.max(1, Number(ttlDays)) * 24 * 3600 * 1000);
-
+    const roomId = dmRoomIdFor(inviterId, other.id);
     await pool.query(
-      `INSERT INTO invites(token, type, inviter_id, room_id, expires_at)
-       VALUES($1,$2,$3,$4,$5)`,
-      [token, type, req.userId, roomId ?? null, expires.toISOString()]
+      `INSERT INTO rooms(id, title, created_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (id) DO NOTHING`,
+      [roomId, other.name || other.email || "DM"]
     );
 
-    const origin = (req.headers.origin as string) || "";
-    const url = origin ? `${origin.replace(/\/$/, "")}/invite/${token}` : null;
+    await pool.query(
+      `INSERT INTO room_members(room_id,user_id)
+       VALUES ($1,$2) ON CONFLICT (room_id,user_id) DO NOTHING`,
+      [roomId, inviterId]
+    );
+    await pool.query(
+      `INSERT INTO room_members(room_id,user_id)
+       VALUES ($1,$2) ON CONFLICT (room_id,user_id) DO NOTHING`,
+      [roomId, other.id]
+    );
 
-    res.json({ ok: true, token, url, expiresAt: expires.toISOString() });
-  } catch (e) {
-    console.error("POST /sg/invites/create", e);
-    res.status(500).json({ error: "CREATE_INVITE_FAILED" });
+    res.json({ roomId });
+  } catch (e: any) {
+    console.error("POST /api/contacts/add-email failed:", e);
+    // мягкие ответы вместо 500 для частых кейсов
+    if (e.code === "23505") return res.status(200).json({ ok: true });
+    if (e.code === "22P02") return res.status(400).json({ error: "BAD_INPUT" });
+    return res.status(500).json({ error: "ADD_CONTACT_FAILED" });
   }
 });
 
+// Создать инвайт (contact | room)
+app.post("/api/invites/create", requireAuth, async (req: any, res) => {
+  const inviterId = req.userId as string;
+  const { type, roomId } = req.body as {
+    type?: "contact" | "room";
+    roomId?: string;
+  };
 
-// ----------------------------- SOCKET.IO -----------------------------------
+  if (!type || !["contact", "room"].includes(type))
+    return res.status(400).json({ error: "BAD_TYPE" });
+
+  try {
+    if (type === "room") {
+      if (!roomId) return res.status(400).json({ error: "NO_ROOM" });
+      // проверим, что юзер — член комнаты
+      const r = await pool.query(
+        `SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND deleted_at IS NULL LIMIT 1`,
+        [roomId, inviterId]
+      );
+      if (!r.rowCount) return res.status(403).json({ error: "NOT_A_MEMBER" });
+    }
+
+    const token = randomUUID();
+    const expiresAtDays = 7;
+    await pool.query(
+      `INSERT INTO invites(token, type, inviter_id, room_id, created_at, expires_at)
+       VALUES ($1,$2,$3,$4, now(), now() + INTERVAL '${expiresAtDays} days')`,
+      [token, type, inviterId, roomId ?? null]
+    );
+
+    // Можно вернуть абсолютный URL, если задашь PUBLIC_BASE_URL
+    const publicBase = process.env.PUBLIC_BASE_URL || "";
+    const url = publicBase ? `${publicBase}/invite/${token}` : token;
+
+    res.json({ token, url });
+  } catch (e) {
+    console.error("POST /api/invites/create failed:", e);
+    res.status(500).json({ error: "INVITE_CREATE_FAILED" });
+  }
+});
+
+// Принять инвайт
+app.post("/api/invites/accept", requireAuth, async (req: any, res) => {
+  const userId = req.userId as string;
+  const { token } = req.body as { token?: string };
+  if (!token) return res.status(400).json({ error: "NO_TOKEN" });
+
+  try {
+    const r = await pool.query(
+      `SELECT token, type, inviter_id, room_id,
+              (expires_at IS NULL OR expires_at > now()) AS valid,
+              used_at
+       FROM invites WHERE token = $1 LIMIT 1`,
+      [token]
+    );
+    if (!r.rowCount) return res.status(400).json({ error: "BAD_TOKEN" });
+    const inv = r.rows[0];
+    if (!inv.valid) return res.status(400).json({ error: "EXPIRED" });
+    if (inv.used_at) return res.status(400).json({ error: "USED" });
+
+    let roomId: string | null = null;
+
+    if (inv.type === "contact") {
+      const otherId = inv.inviter_id as string;
+      if (otherId === userId)
+        return res.status(400).json({ error: "SELF_NOT_ALLOWED" });
+
+      const [a, b] = [userId, otherId].sort();
+      await pool.query(
+        `INSERT INTO contacts(a_user_id,b_user_id)
+         VALUES ($1,$2) ON CONFLICT (a_user_id,b_user_id) DO NOTHING`,
+        [a, b]
+      );
+
+      roomId = dmRoomIdFor(userId, otherId);
+      await pool.query(
+        `INSERT INTO rooms(id, title, created_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (id) DO NOTHING`,
+        [roomId, "DM"]
+      );
+      await pool.query(
+        `INSERT INTO room_members(room_id,user_id)
+         VALUES ($1,$2) ON CONFLICT (room_id,user_id) DO NOTHING`,
+        [roomId, userId]
+      );
+      await pool.query(
+        `INSERT INTO room_members(room_id,user_id)
+         VALUES ($1,$2) ON CONFLICT (room_id,user_id) DO NOTHING`,
+        [roomId, otherId]
+      );
+    } else {
+      // type === 'room'
+      roomId = inv.room_id as string;
+      if (!roomId) return res.status(400).json({ error: "NO_ROOM_IN_INVITE" });
+
+      await pool.query(
+        `INSERT INTO room_members(room_id,user_id)
+         VALUES ($1,$2) ON CONFLICT (room_id,user_id) DO UPDATE SET deleted_at=NULL`,
+        [roomId, userId]
+      );
+    }
+
+    await pool.query(`UPDATE invites SET used_at = now() WHERE token=$1`, [
+      token,
+    ]);
+
+    return res.json({ roomId });
+  } catch (e) {
+    console.error("POST /api/invites/accept failed:", e);
+    res.status(500).json({ error: "INVITE_ACCEPT_FAILED" });
+  }
+});
+
+// --------- SOCKET (чат + сигналинг) ----------
 io.on("connection", (socket) => {
   const userId = (socket.data as any).userId as string;
   console.log("client connected", socket.id, "user:", userId);
 
-  // список комнат (по запросу клиента)
-  socket.on("rooms:list", async () => {
-    try {
-      const rows = await listRoomsForUser(userId);
-      const mapped = rows.map((r: any) => ({
-        id: r.id,
-        title: r.title || r.id,
-        lastMessage: r.last_message ?? null,
-        lastAt: r.last_at ? Number(r.last_at) : null,
-        unread: r.unread ?? 0,
-        pinned: !!r.pinned,
-        muted: !!r.muted,
-        typing: false,
-      }));
-      socket.emit("rooms:list", mapped);
-    } catch (e) {
-      console.error("rooms:list failed", e);
-      socket.emit("rooms:list", []);
-    }
-  });
-
-  // pin/mute/delete
   socket.on("room:pin", async ({ roomId, pin }) => {
     try {
       await pool.query(
@@ -215,14 +378,16 @@ io.on("connection", (socket) => {
 
   socket.on("room:delete", async ({ roomId }) => {
     try {
-      await softDeleteRoomForUser(roomId, userId);
+      await pool.query(
+        `UPDATE room_members SET deleted_at = now() WHERE room_id=$1 AND user_id=$2`,
+        [roomId, userId]
+      );
       socket.emit("rooms:remove", { roomId });
     } catch (e) {
       console.error("room:delete", e);
     }
   });
 
-  // join/leave + роль
   socket.on("room:join", async ({ roomId }) => {
     await socket.join(roomId);
     const sockets = await io.in(roomId).fetchSockets();
@@ -236,7 +401,6 @@ io.on("connection", (socket) => {
     await socket.leave(roomId);
   });
 
-  // чат
   socket.on("chat:typing", ({ roomId, typing }) => {
     socket.to(roomId).emit("chat:typing", { roomId, typing: !!typing });
   });
@@ -246,20 +410,27 @@ io.on("connection", (socket) => {
   });
 
   socket.on("chat:history:get", async ({ roomId }) => {
-    socket.emit("chat:history", { roomId, messages: [], nextBeforeAt: null, hasMore: false });
+    socket.emit("chat:history", {
+      roomId,
+      messages: [],
+      nextBeforeAt: null,
+      hasMore: false,
+    });
   });
-
-  // сигналинг
-  socket.on("webrtc:offer", ({ roomId, sdp }) => socket.to(roomId).emit("webrtc:offer", { sdp }));
-  socket.on("webrtc:answer", ({ roomId, sdp }) => socket.to(roomId).emit("webrtc:answer", { sdp }));
-  socket.on("webrtc:ice", ({ roomId, candidate }) => socket.to(roomId).emit("webrtc:ice", { candidate }));
-
-  // для обратной совместимости
-  socket.on("webrtc:join", ({ roomId }) => socket.emit("room:join", { roomId }));
 
   socket.on("chat:message", (msg) => {
     socket.to(msg.roomId).emit("chat:message", msg);
   });
+
+  socket.on("webrtc:offer", ({ roomId, sdp }) =>
+    socket.to(roomId).emit("webrtc:offer", { sdp })
+  );
+  socket.on("webrtc:answer", ({ roomId, sdp }) =>
+    socket.to(roomId).emit("webrtc:answer", { sdp })
+  );
+  socket.on("webrtc:ice", ({ roomId, candidate }) =>
+    socket.to(roomId).emit("webrtc:ice", { candidate })
+  );
 
   socket.on("disconnect", () => console.log("client disconnected", socket.id));
 });

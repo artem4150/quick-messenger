@@ -1,7 +1,7 @@
 "use client";
 import { create } from "zustand";
 import { io, Socket } from "socket.io-client";
-
+import { useAuth } from '@/lib/auth';  
 /* ===== Types ===== */
 export type Msg = {
   id: string;
@@ -46,13 +46,12 @@ type State = {
   currentRoomId: string | null;
 
   messages: Record<string, Msg[]>;
-  cursors: Record<string, number | null>; // oldest message.at for pagination up
+  cursors: Record<string, number | null>;
   hasMore: Record<string, boolean>;
-  peerReadAt: Record<string, number>; // roomId -> last peer readAt
+  peerReadAt: Record<string, number>;
 
   connect: () => void;
 
-  /** HTTP: pull actual list (excludes soft-deleted) */
   requestRooms: () => Promise<void>;
 
   setCurrentRoom: (roomId: string) => void;
@@ -69,11 +68,9 @@ type State = {
   pinRoom: (roomId: string, pin: boolean) => void;
   muteRoom: (roomId: string, mute: boolean) => void;
 
-  /** HTTP soft-delete for current user (room disappears persistently) */
   deleteRoom: (roomId: string) => Promise<void>;
 
-  /** Contacts & Invites (HTTP) */
-  addContactByEmail: (email: string) => Promise<string | null>; // returns dm roomId
+  addContactByEmail: (email: string) => Promise<string | null>;
   createInvite: (
     type: "contact" | "room",
     roomId?: string
@@ -81,8 +78,8 @@ type State = {
   acceptInvite: (token: string) => Promise<string | null>;
 };
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_SIGNALING_URL || "http://localhost:4000";
+/** WS: берём из env (для тюннеля/локалки). HTTP: всегда относительные пути `/api/*`. */
+const WS_URL = process.env.NEXT_PUBLIC_SIGNALING_URL || "";
 
 export const useAppStore = create<State>((set, get) => ({
   socket: null,
@@ -101,7 +98,7 @@ export const useAppStore = create<State>((set, get) => ({
     const token =
       typeof window !== "undefined" ? localStorage.getItem("token") : null;
 
-    const s = io(API_BASE, {
+    const s = io(WS_URL || undefined, {
       transports: ["websocket"],
       withCredentials: true,
       auth: token ? { token } : undefined,
@@ -113,18 +110,14 @@ export const useAppStore = create<State>((set, get) => ({
 
     s.on("connect", async () => {
       console.log("socket connected", s.id);
-      // подтянуть список комнат (HTTP, чтобы исключить soft-deleted)
       await get().requestRooms();
-      // ре-join текущей
       const current = get().currentRoomId;
       if (current) s.emit("room:join", { roomId: current });
     });
 
     s.on("connect_error", (e) => console.warn("socket error", e.message));
 
-    /* --- realtime updates (push from server) --- */
-
-    // точечные патчи по комнате
+    // --- точечные патчи по комнате
     s.on(
       "rooms:update",
       ({ roomId, patch }: { roomId: string; patch: Partial<RoomRow> }) => {
@@ -137,7 +130,7 @@ export const useAppStore = create<State>((set, get) => ({
       }
     );
 
-    // сервер просит убрать комнату (например, удалена другими условиями)
+    // --- удалить комнату локально (по событию сервера)
     s.on("rooms:remove", ({ roomId }: { roomId: string }) => {
       set((state) => {
         const rooms = { ...state.rooms };
@@ -151,12 +144,21 @@ export const useAppStore = create<State>((set, get) => ({
         const peerReadAt = { ...state.peerReadAt };
         delete peerReadAt[roomId];
         const roomOrder = sortRooms(rooms);
-        const currentRoomId = state.currentRoomId === roomId ? null : state.currentRoomId;
-        return { rooms, messages, cursors, hasMore, peerReadAt, roomOrder, currentRoomId };
+        const currentRoomId =
+          state.currentRoomId === roomId ? null : state.currentRoomId;
+        return {
+          rooms,
+          messages,
+          cursors,
+          hasMore,
+          peerReadAt,
+          roomOrder,
+          currentRoomId,
+        };
       });
     });
 
-    // история (первая страница и догрузка вверх)
+    // --- история (первая страница и догрузка вверх)
     s.on(
       "chat:history",
       ({
@@ -188,7 +190,7 @@ export const useAppStore = create<State>((set, get) => ({
       }
     );
 
-    // входящие сообщения
+    // --- входящие сообщения
     s.on("chat:message", (m: Msg) => {
       set((state) => {
         const list = state.messages[m.roomId] ?? [];
@@ -200,9 +202,7 @@ export const useAppStore = create<State>((set, get) => ({
             ...(state.rooms[m.roomId] || { id: m.roomId, title: m.roomId }),
             lastMessage: m.text,
             lastAt: m.at,
-            unread: isCurrent
-              ? 0
-              : (state.rooms[m.roomId]?.unread ?? 0) + 1,
+            unread: isCurrent ? 0 : (state.rooms[m.roomId]?.unread ?? 0) + 1,
           },
         };
         return {
@@ -213,7 +213,7 @@ export const useAppStore = create<State>((set, get) => ({
       });
     });
 
-    // typing + авто-отключение через 3s
+    // --- typing + авто-отключение через 3s
     const typingTimers: Record<string, any> = {};
     s.on(
       "chat:typing",
@@ -240,7 +240,7 @@ export const useAppStore = create<State>((set, get) => ({
       }
     );
 
-    // read receipts от собеседника
+    // --- read receipts от собеседника
     s.on(
       "room:read",
       ({ roomId, userId, at }: { roomId: string; userId: string; at: number }) => {
@@ -256,22 +256,22 @@ export const useAppStore = create<State>((set, get) => ({
     set({ socket: s });
   },
 
-  /* ---------- HTTP: список комнат ---------- */
+  /* ---------- HTTP: список комнат (через rewrites) ---------- */
   requestRooms: async () => {
     const token =
       typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    const r = await fetch(`${API_BASE}/api/rooms`, {
+
+    const r = await fetch(`/api/rooms`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       credentials: "include",
     }).catch(() => null);
+
     if (!r || !r.ok) return;
+
     const data = await r.json();
+    const rows: RoomRow[] = Array.isArray(data) ? data : (data.rooms ?? []);
     const map: Record<string, RoomRow> = {};
-    const order: string[] = [];
-    for (const row of (data.rooms ?? []) as RoomRow[]) {
-      map[row.id] = row;
-      order.push(row.id);
-    }
+    rows.forEach((row) => (map[row.id] = row));
     set({ rooms: map, roomOrder: sortRooms(map) });
   },
 
@@ -279,7 +279,6 @@ export const useAppStore = create<State>((set, get) => ({
     set({ currentRoomId: roomId });
     get().socket?.emit("room:join", { roomId });
     get().socket?.emit("chat:read", { roomId });
-    // если ещё не загружали историю — запросим первую страницу
     if (!(get().messages[roomId]?.length)) {
       get().socket?.emit("chat:history:get", { roomId, limit: 50 });
     }
@@ -299,35 +298,34 @@ export const useAppStore = create<State>((set, get) => ({
     });
   },
 
-  sendMessage: (roomId, text) => {
-    const msg: Msg = {
-      id: crypto.randomUUID(),
-      roomId,
-      authorId: "me",
-      authorName: "me",
-      text,
-      at: Date.now(),
+sendMessage: (roomId, text) => {
+  const me = useAuth.getState().user;
+  const msg: Msg = {
+    id: crypto.randomUUID(),
+    roomId,
+    authorId: String(me?.id ?? ""),   // ← реальный id пользователя
+    authorName: me?.name ?? "",
+    text,
+    at: Date.now(),
+  };
+
+  get().socket?.emit("chat:message", msg);
+
+  set((state) => {
+    const list = state.messages[roomId] ?? [];
+    const next = [...list, msg];
+    const rooms = {
+      ...state.rooms,
+      [roomId]: {
+        ...(state.rooms[roomId] || { id: roomId, title: roomId }),
+        lastMessage: msg.text,
+        lastAt: msg.at,
+        unread: 0,
+      },
     };
-    get().socket?.emit("chat:message", msg);
-    set((state) => {
-      const list = state.messages[roomId] ?? [];
-      const next = [...list, msg];
-      const rooms = {
-        ...state.rooms,
-        [roomId]: {
-          ...(state.rooms[roomId] || { id: roomId, title: roomId }),
-          lastMessage: msg.text,
-          lastAt: msg.at,
-          unread: 0,
-        },
-      };
-      return {
-        messages: { ...state.messages, [roomId]: next },
-        rooms,
-        roomOrder: sortRooms(rooms),
-      };
-    });
-  },
+    return { messages: { ...state.messages, [roomId]: next }, rooms, roomOrder: sortRooms(rooms) };
+  });
+},
 
   markRead: (roomId) => get().socket?.emit("chat:read", { roomId }),
   setTyping: (roomId, typing) =>
@@ -338,7 +336,6 @@ export const useAppStore = create<State>((set, get) => ({
 
   /* ---------- HTTP: soft delete ---------- */
   deleteRoom: async (roomId) => {
-    // оптимистично скрываем локально
     set((state) => {
       const rooms = { ...state.rooms };
       delete rooms[roomId];
@@ -366,7 +363,7 @@ export const useAppStore = create<State>((set, get) => ({
 
     const token =
       typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    await fetch(`${API_BASE}/api/rooms/${roomId}`, {
+    await fetch(`/api/rooms/${roomId}`, {
       method: "DELETE",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       credentials: "include",
@@ -377,7 +374,7 @@ export const useAppStore = create<State>((set, get) => ({
   addContactByEmail: async (email) => {
     const token =
       typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    const r = await fetch(`${API_BASE}/api/contacts/add-email`, {
+    const r = await fetch(`/api/contacts/add-email`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -395,7 +392,7 @@ export const useAppStore = create<State>((set, get) => ({
   createInvite: async (type, roomId) => {
     const token =
       typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    const r = await fetch(`${API_BASE}/api/invites/create`, {
+    const r = await fetch(`/api/invites/create`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -412,7 +409,7 @@ export const useAppStore = create<State>((set, get) => ({
   acceptInvite: async (tokenStr) => {
     const token =
       typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    const r = await fetch(`${API_BASE}/api/invites/accept`, {
+    const r = await fetch(`/api/invites/accept`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

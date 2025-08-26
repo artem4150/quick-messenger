@@ -1,49 +1,178 @@
-import { Pool } from 'pg';
-import { randomUUID } from 'crypto';
-export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// apps/signaling-server/src/db.ts
+import pg from "pg";
+const { Pool } = pg;
 
-export async function ensureDmRoom(userA: string, userB: string) {
-  const [a, b] = userA < userB ? [userA, userB] : [userB, userA];
-  // ищем room типа 'dm' с обоими участниками и без deleted_at
-  const q = `
-    WITH pair AS (
-      SELECT $1::text AS a, $2::text AS b
-    )
-    SELECT r.id
-    FROM rooms r
-    JOIN room_members m1 ON m1.room_id=r.id AND m1.user_id=(SELECT a FROM pair) AND m1.deleted_at IS NULL
-    JOIN room_members m2 ON m2.room_id=r.id AND m2.user_id=(SELECT b FROM pair) AND m2.deleted_at IS NULL
-    WHERE r.type='dm'
-    LIMIT 1
-  `;
-  const found = await pool.query(q, [a, b]);
-  if (found.rowCount) return found.rows[0].id as string;
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined,
+});
 
-  const roomId = randomUUID();
-  await pool.query(`INSERT INTO rooms (id, title, type) VALUES ($1,$2,'dm')`, [roomId, null]);
-  await pool.query(`INSERT INTO room_members (room_id,user_id) VALUES ($1,$2),($1,$3)`, [roomId, a, b]);
-  return roomId;
+/** Создаём недостающие таблицы (идемпотентно) */
+export async function ensureSchema() {
+  await pool.query(`
+    -- базовые комнаты и сообщения
+    CREATE TABLE IF NOT EXISTS rooms (
+      id         TEXT PRIMARY KEY,
+      title      TEXT,
+      is_direct  BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id        TEXT PRIMARY KEY,
+      room_id   TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      author_id TEXT NOT NULL,
+      text      TEXT NOT NULL,
+      at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS messages_room_at_idx ON messages(room_id, at DESC);
+
+    -- per-user состояние комнаты
+    CREATE TABLE IF NOT EXISTS room_members (
+      room_id    TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      user_id    TEXT NOT NULL,
+      role       TEXT DEFAULT 'member',
+      pinned     BOOLEAN DEFAULT FALSE,
+      muted      BOOLEAN DEFAULT FALSE,
+      unread     INTEGER DEFAULT 0,
+      deleted_at TIMESTAMPTZ,
+      PRIMARY KEY (room_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS room_members_user_id_idx ON room_members(user_id) WHERE deleted_at IS NULL;
+
+    -- контакты (двусторонние, канонический порядок)
+    CREATE TABLE IF NOT EXISTS contacts (
+      a_user_id TEXT NOT NULL,
+      b_user_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (a_user_id, b_user_id)
+    );
+
+    -- приглашения
+    CREATE TABLE IF NOT EXISTS invites (
+      token      TEXT PRIMARY KEY,
+      type       TEXT NOT NULL CHECK (type IN ('contact','room')),
+      inviter_id TEXT NOT NULL,
+      room_id    TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      expires_at TIMESTAMPTZ,
+      used_at    TIMESTAMPTZ
+    );
+  `);
 }
 
-export async function softDeleteRoomForUser(roomId: string, userId: string) {
+/** Список комнат пользователя с последним сообщением + состоянием участника */
+export async function listRoomsForUser(userId: string) {
+  const sql = `
+  SELECT
+    r.id,
+    COALESCE(r.title, r.id) AS title,
+    lm.last_message,
+    EXTRACT(EPOCH FROM lm.last_at) * 1000 AS last_at,
+    COALESCE(rm.unread, 0)  AS unread,
+    COALESCE(rm.pinned, FALSE) AS pinned,
+    COALESCE(rm.muted,  FALSE) AS muted
+  FROM room_members rm
+  JOIN rooms r ON r.id = rm.room_id
+  LEFT JOIN LATERAL (
+    SELECT m.text AS last_message, m.at AS last_at
+    FROM messages m
+    WHERE m.room_id = r.id
+    ORDER BY m.at DESC
+    LIMIT 1
+  ) lm ON true
+  WHERE rm.user_id = $1
+    AND rm.deleted_at IS NULL
+  ORDER BY
+    COALESCE(rm.pinned, FALSE) DESC,
+    COALESCE(lm.last_at, 'epoch'::timestamptz) DESC;
+  `;
+  const { rows } = await pool.query(sql, [userId]);
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    last_message: r.last_message ?? null,
+    last_at: r.last_at ?? null,
+    unread: Number(r.unread ?? 0),
+    pinned: !!r.pinned,
+    muted: !!r.muted,
+  }));
+}
+
+/** Найти пользователя по email (ожидаем таблицу users(email,id)) */
+export async function findUserIdByEmail(email: string): Promise<string | null> {
+  const q = await pool.query(`SELECT id FROM users WHERE email = $1 LIMIT 1`, [email]);
+  return q.rows[0]?.id ?? null;
+}
+
+/** Канонический DM room id для пары пользователей */
+export function canonicalDmId(a: string, b: string) {
+  const [x, y] = [a, b].sort();
+  return `dm:${x}:${y}`;
+}
+
+/** Убедиться, что комната существует */
+export async function ensureRoom(roomId: string, params?: { title?: string; is_direct?: boolean }) {
   await pool.query(
-    `UPDATE room_members SET deleted_at=now(), unread=0 WHERE room_id=$1 AND user_id=$2`,
+    `INSERT INTO rooms (id, title, is_direct) VALUES ($1, $2, $3)
+     ON CONFLICT (id) DO NOTHING`,
+    [roomId, params?.title ?? null, !!params?.is_direct]
+  );
+}
+
+/** Убедиться, что участник есть (и не помечен удалённым) */
+export async function upsertMember(roomId: string, userId: string) {
+  await pool.query(
+    `INSERT INTO room_members (room_id, user_id) VALUES ($1,$2)
+     ON CONFLICT (room_id, user_id)
+     DO UPDATE SET deleted_at = NULL`,
     [roomId, userId]
   );
 }
 
-export async function listRoomsForUser(userId: string) {
-  const sql = `
-    SELECT r.id, COALESCE(r.title, '') AS title, r.type,
-           rm.pinned, rm.muted, rm.unread, rm.deleted_at,
-           (SELECT text FROM messages WHERE room_id=r.id ORDER BY at DESC LIMIT 1) AS last_message,
-           (SELECT EXTRACT(EPOCH FROM at)*1000 FROM messages WHERE room_id=r.id ORDER BY at DESC LIMIT 1) AS last_at
-    FROM rooms r
-    JOIN room_members rm ON rm.room_id=r.id
-    WHERE rm.user_id=$1 AND rm.deleted_at IS NULL
-    ORDER BY COALESCE((SELECT at FROM messages WHERE room_id=r.id ORDER BY at DESC LIMIT 1), r.created_at) DESC
-    LIMIT 200
-  `;
-  const { rows } = await pool.query(sql, [userId]);
-  return rows;
+/** Добавить пару в contacts (min,max) */
+export async function addContactPair(u1: string, u2: string) {
+  const [a, b] = [u1, u2].sort();
+  await pool.query(
+    `INSERT INTO contacts (a_user_id, b_user_id) VALUES ($1,$2)
+     ON CONFLICT DO NOTHING`,
+    [a, b]
+  );
+}
+
+/** Инвайты */
+export async function createInviteRow(token: string, type: "contact" | "room", inviter: string, roomId?: string, days = 30) {
+  await pool.query(
+    `INSERT INTO invites (token, type, inviter_id, room_id, expires_at)
+     VALUES ($1,$2,$3,$4, now() + ($5 || ' days')::interval)`,
+    [token, type, inviter, roomId ?? null, String(days)]
+  );
+}
+export async function getInvite(token: string) {
+  const { rows } = await pool.query(`SELECT * FROM invites WHERE token=$1 LIMIT 1`, [token]);
+  return rows[0] ?? null;
+}
+export async function markInviteUsed(token: string) {
+  await pool.query(`UPDATE invites SET used_at = now() WHERE token=$1 AND used_at IS NULL`, [token]);
+}
+export async function softDeleteRoomForUser(roomId: string, userId: string) {
+  // Пытаемся пометить существующее участие как удалённое
+  const r = await pool.query(
+    `UPDATE room_members
+       SET deleted_at = now()
+     WHERE room_id = $1 AND user_id = $2`,
+    [roomId, userId]
+  );
+
+  // Если строки не было (пользователь не числился участником), создадим запись
+  // сразу в состоянии deleted — чтобы она гарантированно не всплывала в списке.
+  if (r.rowCount === 0) {
+    await pool.query(
+      `INSERT INTO room_members (room_id, user_id, deleted_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (room_id, user_id)
+       DO UPDATE SET deleted_at = EXCLUDED.deleted_at`,
+      [roomId, userId]
+    );
+  }
 }
